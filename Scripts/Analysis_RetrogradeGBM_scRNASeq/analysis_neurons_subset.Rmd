@@ -1,0 +1,143 @@
+---
+title: "Analysis of neuronal subset"
+author: "Maria Puschhof"
+date: "2024-03-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+```
+
+In this document, the entire dataset will be subsetted to specfically analyse the neurons. 
+
+## Data import and meta data annotation
+
+```{r read_data}
+neuron <- readRDS("../data/out/neurons_all.rds")
+```
+
+## Subset the data
+
+Restrict dataset to neurons
+
+```{r select_neurons}
+cells_rm <- rownames(neuron@meta.data)[sapply(neuron[["cell_types"]], 
+                                              function(z) {z != "neuron"})]
+neuron <- subset(neuron, cells = cells_rm, invert=T)
+```
+
+Restrict dataset to experimental conditions with rabies virus.
+
+```{r select_rabies}
+cells_rm <- rownames(neuron@meta.data)[sapply(neuron[["Sample"]], 
+                                              function(z) {z %in% c("ccNeurons", "onlyNeurons")})]
+neuron <- subset(neuron, cells = cells_rm, invert=T)
+```
+
+Clean up dataset
+
+```{r clean_up}
+# Erase module scores
+if(length(colnames(neuron@meta.data)) > 21)
+  neuron@meta.data[,22:length(colnames(neuron@meta.data))] <- NULL
+
+# Clean up seurat object
+neuron[["pca"]] <- NULL
+neuron[["integrated.cca"]] <- NULL
+neuron[["umap.unintegrated"]] <- NULL
+neuron[["umap.integrated"]] <- NULL
+neuron[["RNA"]]@layers[["scale.data"]] <- NULL
+```
+
+### Data integration
+
+Perform normalization, feature selection, and PCA at per sample basis.
+
+```{r per_sample}
+neuron[["RNA"]] <- split(neuron[["RNA"]], f = neuron$plate)
+neuron <- FindVariableFeatures(neuron, selection.method = "vst", nfeatures = 4000)
+neuron <- ScaleData(neuron)
+neuron <- RunPCA(neuron, verbose = FALSE)
+neuron <- FindNeighbors(neuron, dims = 1:30, reduction = "pca")
+neuron <- FindClusters(neuron, cluster.name = "unintegrated_clusters", 
+                       resolution=0.8)
+neuron <- RunUMAP(neuron, dims = 1:30, reduction = "pca", 
+                  reduction.name = "umap.unintegrated")
+```
+
+Integrate the samples using Seurat’s CCA method.
+
+```{r integrate_data}
+neuron <- IntegrateLayers(object = neuron, method = CCAIntegration, 
+                          orig.reduction = "pca", new.reduction = "integrated.cca",
+                          verbose = FALSE)
+neuron[["RNA"]] <- JoinLayers(neuron[["RNA"]])
+```
+
+### Dimension reduction and clustering
+
+```{r umap}
+neuron <- FindNeighbors(neuron, dims = 1:30, reduction = "integrated.cca")
+neuron <- FindClusters(neuron, cluster.name = "integrated_clusters", resolution=0.8)
+neuron <- RunUMAP(neuron, dims = 1:30, reduction = "integrated.cca", 
+                  reduction.name = "umap.integrated")
+```
+
+```{r umap_plot}
+DimPlot(neuron, reduction = "umap.integrated", group.by = "integrated_clusters")
+```
+
+```{r umap_gpf_plot}
+DimPlot(neuron, reduction = "umap.integrated", group.by = "gfp_gate", 
+        cols = c("lightgrey", "green"))
+```
+
+## Cluster composition
+
+```{r gfp_distr}
+distr <- table(neuron@meta.data[,which(colnames(neuron@meta.data) == "integrated_clusters")], 
+               neuron$gfp_gate)
+
+# Bar graph relative counts
+neuron@meta.data$gfp_gate <- factor(neuron@meta.data$gfp_gate, levels = c(TRUE, FALSE))
+ggplot(neuron@meta.data, aes(x = integrated_clusters, fill = gfp_gate)) +
+      geom_bar(position="fill") +
+      scale_fill_manual(values = c('FALSE' = "grey", 'TRUE' = "green")) +
+      ylab("Fraction of cells") + xlab("Clusters") + labs(fill = "Connected neurons") +
+      theme_minimal()
+```
+
+Statistical test for enrichment of connected neurons in individual clusters
+
+```{r gfp_distr_test}
+
+fisher <- fisher.test(distr, simulate.p.value = TRUE, B = 1e5)
+
+# Convert table object to data frame for plotting
+distr_plot <- data.frame( 
+  "cluster" = rownames(distr),
+  "Connected" = distr[,1], 
+  "Unconnected" = distr[,2],
+  "pct.true" = prop.table(distr, 1)[, "TRUE"]*100
+)
+
+# Underlying plot
+ggplot(distr_plot, aes(x=cluster, y=pct.true)) +
+    geom_bar(stat = "identity", fill = "#1fc600") + 
+    theme(panel.background = element_rect(fill = "white")) +
+    theme(axis.line = element_line(linewidth = .5, colour = "black")) +
+    labs(x = "Cluster", y = "Relative connectivity") +
+    annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.1,
+             label = paste("Fisher test p-value:", 
+                           format(fisher$p.value, digits = 2)), size = 3)
+```
+
+## Saving the data object
+
+```{r save_data}
+saveRDS(neuron, file="../data/out/neurons_subset.rds")
+```

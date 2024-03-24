@@ -1,0 +1,215 @@
+---
+title: "Analysis of entire dataset"
+author: "Maria Puschhof"
+date: "2024-03-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+```
+
+This document contains the details of processing of the entire dataset.
+
+## Data import and meta data annotation
+
+```{r read_data}
+# Import of data and meta data
+neuron <- readRDS("../data/RatCells_unfiltered.rds")
+meta_sort <- read.csv("../data/sort_data_merged.csv")
+
+# Cut down meta data to relevant cells
+meta_sort <- meta_sort[meta_sort$seq_cell_id %in% rownames(neuron@meta.data),]
+meta_sort <- meta_sort[match(rownames(neuron@meta.data), meta_sort$seq_cell_id),]
+
+# Assignment of meta data to Seurat object
+if(identical(meta_sort$seq_cell_id, rownames(neuron@meta.data))){
+  neuron[["cell_id"]] <- meta_sort$cell_id
+  neuron[["Sample.Name"]] <- meta_sort$Sample.Name
+  neuron[["gfp_gate"]] <- meta_sort$gfp_gate
+  neuron[["plate"]] <- meta_sort$plate
+}
+
+# Annotation of experimental condition by plate number
+plate_to_sample <- c(
+  "P3" = "onlyNeurons",
+  "P4" = "N2Cneg",
+  "P5" = "N2Cpos",
+  "P6" = "N2Cpos",
+  "P16" = "N2Cneg",
+  "P21" = "ccNeurons"
+)
+neuron[["Sample"]] <- unname(sapply(neuron@meta.data$plate, function(z){
+  plate_to_sample[z]
+}))
+```
+
+## Preprocessing and QC
+
+```{r qc_plots}
+# Set QC parameters
+nFeature_min <- 5000
+nCount_min <- 100000
+mito_max <- 4
+nFeature_max <- 11250
+nCount_max <- 2e6
+
+# Feature count QC
+VlnPlot(neuron, features = "nFeature_RNA") + 
+  geom_hline(yintercept = nFeature_min, color="red") +
+  geom_hline(yintercept = nFeature_max, color="red")
+
+# Total count QC
+VlnPlot(neuron, features = "nCount_RNA") + 
+  geom_hline(yintercept = nCount_min, color="red") +
+  geom_hline(yintercept = nCount_max, color="red")
+
+# Mitochondrial content QC
+VlnPlot(neuron, features = "percent.mt") + 
+  geom_hline(yintercept = mito_max, color="red")
+
+VlnPlot(neuron, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+```
+
+Filtering of the data by quality control parameters.
+
+```{r filtering_qc}
+
+neuron <- subset(neuron, subset = nFeature_RNA > nFeature_min & 
+                nFeature_RNA < nFeature_max &
+                nCount_RNA > nCount_min &
+                nCount_RNA < nCount_max &
+                percent.mt < mito_max)
+```
+
+### Data integration
+
+Perform normalization, feature selection, and PCA at per sample basis.
+
+```{r per_sample}
+neuron[["RNA"]] <- split(neuron[["RNA"]], f = neuron$plate)
+neuron <- NormalizeData(neuron)
+neuron <- FindVariableFeatures(neuron, nfeatures = 4000)
+neuron <- ScaleData(neuron)
+neuron <- RunPCA(neuron, verbose = FALSE)
+neuron <- FindNeighbors(neuron, dims = 1:30, reduction = "pca")
+neuron <- FindClusters(neuron, cluster.name = "unintegrated_clusters")
+neuron <- RunUMAP(neuron, dims = 1:30, reduction = "pca", 
+                  reduction.name = "umap.unintegrated")
+```
+
+Integrate the samples using Seurat’s CCA method.
+
+```{r integrate_data}
+neuron <- IntegrateLayers(object = neuron, method = CCAIntegration, 
+                          orig.reduction = "pca", new.reduction = "integrated.cca",
+                          verbose = FALSE)
+neuron[["RNA"]] <- JoinLayers(neuron[["RNA"]])
+```
+
+### Dimension reduction and clustering
+
+```{r umap}
+neuron <- FindNeighbors(neuron, dims = 1:30, reduction = "integrated.cca")
+neuron <- FindClusters(neuron, cluster.name = "integrated_clusters")
+neuron <- RunUMAP(neuron, dims = 1:30, reduction = "integrated.cca", 
+                  reduction.name = "umap.integrated")
+
+```
+
+```{r umap_plot}
+DimPlot(neuron, reduction = "umap.integrated", group.by = "integrated_clusters")
+```
+
+## Cell state annotation using public references
+
+The cell state classification is based on marker genes of a meta-analysis of GBM studies (Ruiz-Moreno et al., 2022, bioRxiv) as provided by supplementary table 4.
+
+```{r read_gbmap}
+gbmap <- read.csv("../data/RuizMoreno_bioRxiv_2022_ST4.csv", skip=1)
+# Extract data of level 3 annotation
+gbmap <- gbmap[,grep("\\.2$", colnames(gbmap))]
+gbmap <- gbmap[gbmap$cluster.2 != "",]
+```
+
+Get marker genes for each cell state
+
+```{r marker_genes}
+markers <- list()
+for(state in unique(gbmap$cluster.2)){
+  markers[[state]] <- gbmap$gene.2[gbmap$cluster.2 == state]
+}
+to_lowercase <- function(strings) {
+  strings <- tolower(strings)
+  sapply(strings, function(x) paste0(toupper(substr(x, 1, 1)), substr(x, 2, nchar(x))))
+}
+markers <- lapply(markers, to_lowercase)
+```
+
+Calculate similarity to expression profiles in data using Seurat’s module score function
+
+```{r module_score}
+for(state in names(markers)){
+  neuron <- AddModuleScore(neuron, features=markers[state],
+                           name=paste0("int.", state), reduction = "umap.integrated")
+}
+```
+
+### Identification of astrocytes and oligodendrocytes
+
+```{r score_distribution}
+VlnPlot(neuron, features="int.Astrocyte1", group.by="integrated_clusters")
+
+VlnPlot(neuron, features="int.Oligodendrocyte1", group.by="integrated_clusters")
+```
+
+Identify clusters with a mean score exceeding the threshold 0.1
+
+```{r cluster_identification}
+thres = 0.1
+module = "int.Astrocyte1"
+
+# Calculate mean astrocyte score
+score_mean <- neuron@meta.data %>% 
+  select("integrated_clusters", module) %>%
+  group_by(!!sym("integrated_clusters")) %>%
+  summarise(mean=mean(!!sym(module)), n=n())
+
+# Identify astrocyte clusters
+cl_astro <- as.character(score_mean[score_mean$mean > thres,][["integrated_clusters"]])
+print(paste("Astrocyte clusters:", paste(cl_astro, collapse = ", ")))
+
+
+module = "int.Oligodendrocyte1"
+
+# Calculate mean oligodendrocyte score
+score_mean <- neuron@meta.data %>% 
+  select("integrated_clusters", module) %>%
+  group_by(!!sym("integrated_clusters")) %>%
+  summarise(mean=mean(!!sym(module)), n=n())
+
+# Identify oligodendrocyte clusters
+cl_oligo <- as.character(score_mean[score_mean$mean > thres,][["integrated_clusters"]])
+print(paste("Oligodendrocyte clusters:", paste(cl_oligo, collapse = ", ")))
+```
+
+Assign cell types and plot distribution
+
+```{r cell_types}
+neuron[["cell_types"]] <- sapply(neuron@meta.data["integrated_clusters"], function(z){
+  ifelse(z %in% cl_astro, "astrocyte", ifelse(z %in% cl_oligo, "oligodendrocyte", "neuron"))
+})
+
+DimPlot(neuron, reduction = "umap.integrated", group.by = "cell_types",
+        cols = c("astrocyte" = "#2a77b5", "oligodendrocyte" = "#e89e20", "neuron" = "#d74749"))
+```
+
+
+## Saving the data object
+
+```{r save_data}
+saveRDS(neuron, file="../data/out/neurons_all.rds")
+```
